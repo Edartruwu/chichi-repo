@@ -1,0 +1,374 @@
+package rolesrv
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/Edartruwu/chichi-repo/backend/internal/errx"
+	"github.com/Edartruwu/chichi-repo/backend/internal/iam/authz"
+	"github.com/Edartruwu/chichi-repo/backend/internal/iam/role"
+	"github.com/Edartruwu/chichi-repo/backend/internal/iam/scopes"
+	"github.com/Edartruwu/chichi-repo/backend/internal/iam/tenant"
+	"github.com/Edartruwu/chichi-repo/backend/internal/iam/user"
+	"github.com/Edartruwu/chichi-repo/backend/internal/kernel"
+	"github.com/google/uuid"
+)
+
+type RoleService struct {
+	roleRepo   role.RoleRepository
+	tenantRepo tenant.TenantRepository
+	userRepo   user.UserRepository
+}
+
+func NewRoleService(
+	roleRepo role.RoleRepository,
+	tenantRepo tenant.TenantRepository,
+	userRepo user.UserRepository,
+) *RoleService {
+	return &RoleService{
+		roleRepo:   roleRepo,
+		tenantRepo: tenantRepo,
+		userRepo:   userRepo,
+	}
+}
+
+func (s *RoleService) CreateRole(
+	ctx context.Context,
+	authCtx *kernel.AuthContext,
+	tenantID kernel.TenantID,
+	req role.CreateRoleRequest,
+) (*role.Role, error) {
+	if err := authz.Require(authCtx, tenantID, scopes.ScopeRolesWrite); err != nil {
+		return nil, err
+	}
+
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+
+	tenantEntity, err := s.tenantRepo.FindByID(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if !tenantEntity.IsActive() {
+		return nil, tenant.ErrTenantSuspended()
+	}
+
+	// Check for duplicate name
+	existing, err := s.roleRepo.FindByName(ctx, req.Name, tenantID)
+	if err != nil && !errors.Is(err, role.ErrRoleNotFound()) {
+		return nil, errx.Wrap(err, "failed to check role name", errx.TypeInternal)
+	}
+	if existing != nil {
+		return nil, role.ErrRoleAlreadyExists().WithDetail("name", req.Name)
+	}
+
+	if err := s.validateScopes(req.Scopes, authCtx.Scopes); err != nil {
+		return nil, err
+	}
+
+	newRole := &role.Role{
+		ID:          kernel.NewRoleID(uuid.NewString()),
+		TenantID:    tenantID,
+		Name:        req.Name,
+		Description: req.Description,
+		Scopes:      req.Scopes,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+
+	if err := s.roleRepo.Save(ctx, *newRole); err != nil {
+		return nil, errx.Wrap(err, "failed to save role", errx.TypeInternal)
+	}
+
+	return newRole, nil
+}
+
+func (s *RoleService) GetRoleByID(
+	ctx context.Context,
+	authCtx *kernel.AuthContext,
+	roleID kernel.RoleID,
+	tenantID kernel.TenantID,
+) (*role.RoleDTO, error) {
+	if err := authz.Require(authCtx, tenantID, scopes.ScopeRolesRead); err != nil {
+		return nil, err
+	}
+
+	r, err := s.roleRepo.FindByID(ctx, roleID, tenantID)
+	if err != nil {
+		return nil, role.ErrRoleNotFound()
+	}
+	dto := r.ToDTO()
+	return &dto, nil
+}
+
+func (s *RoleService) GetTenantRoles(
+	ctx context.Context,
+	authCtx *kernel.AuthContext,
+	tenantID kernel.TenantID,
+) (*role.RoleListResponse, error) {
+	if err := authz.Require(authCtx, tenantID, scopes.ScopeRolesRead); err != nil {
+		return nil, err
+	}
+
+	roles, err := s.roleRepo.FindByTenant(ctx, tenantID)
+	if err != nil {
+		return nil, errx.Wrap(err, "failed to get roles", errx.TypeInternal)
+	}
+
+	dtos := make([]role.RoleDTO, 0, len(roles))
+	for _, r := range roles {
+		dtos = append(dtos, r.ToDTO())
+	}
+
+	return &role.RoleListResponse{
+		Roles: dtos,
+		Total: len(dtos),
+	}, nil
+}
+
+func (s *RoleService) UpdateRole(
+	ctx context.Context,
+	authCtx *kernel.AuthContext,
+	roleID kernel.RoleID,
+	tenantID kernel.TenantID,
+	req role.UpdateRoleRequest,
+) (*role.RoleDTO, error) {
+	if err := authz.Require(authCtx, tenantID, scopes.ScopeRolesWrite); err != nil {
+		return nil, err
+	}
+
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+
+	r, err := s.roleRepo.FindByID(ctx, roleID, tenantID)
+	if err != nil {
+		return nil, role.ErrRoleNotFound()
+	}
+
+	if req.Name != nil {
+		// Check for duplicate name (exclude current role)
+		existing, err := s.roleRepo.FindByName(ctx, *req.Name, tenantID)
+		if err != nil && !errors.Is(err, role.ErrRoleNotFound()) {
+			return nil, errx.Wrap(err, "failed to check role name", errx.TypeInternal)
+		}
+		if existing != nil && existing.ID != r.ID {
+			return nil, role.ErrRoleAlreadyExists().WithDetail("name", *req.Name)
+		}
+		r.Name = *req.Name
+	}
+	if req.Description != nil {
+		r.Description = *req.Description
+	}
+	if req.Scopes != nil {
+		if err := s.validateScopes(req.Scopes, authCtx.Scopes); err != nil {
+			return nil, err
+		}
+		r.SetScopes(req.Scopes)
+	}
+
+	r.UpdatedAt = time.Now().UTC()
+
+	if err := s.roleRepo.Save(ctx, *r); err != nil {
+		return nil, errx.Wrap(err, "failed to update role", errx.TypeInternal)
+	}
+
+	dto := r.ToDTO()
+	return &dto, nil
+}
+
+func (s *RoleService) DeleteRole(
+	ctx context.Context,
+	authCtx *kernel.AuthContext,
+	roleID kernel.RoleID,
+	tenantID kernel.TenantID,
+) error {
+	if err := authz.Require(authCtx, tenantID, scopes.ScopeRolesDelete); err != nil {
+		return err
+	}
+
+	_, err := s.roleRepo.FindByID(ctx, roleID, tenantID)
+	if err != nil {
+		return role.ErrRoleNotFound()
+	}
+
+	return s.roleRepo.Delete(ctx, roleID, tenantID)
+}
+
+// AssignRoleToUser assigns a role to a user
+func (s *RoleService) AssignRoleToUser(
+	ctx context.Context,
+	authCtx *kernel.AuthContext,
+	roleID kernel.RoleID,
+	userID kernel.UserID,
+	tenantID kernel.TenantID,
+) error {
+	if err := authz.Require(authCtx, tenantID, scopes.ScopeRolesAssign); err != nil {
+		return err
+	}
+
+	req := role.AssignRoleRequest{UserID: userID}
+	if err := req.Validate(); err != nil {
+		return err
+	}
+
+	// Verify role exists and reject legacy platform-bearing roles.
+	r, err := s.roleRepo.FindByID(ctx, roleID, tenantID)
+	if err != nil {
+		return role.ErrRoleNotFound()
+	}
+	if scopes.ContainsPlatformScope(r.Scopes) {
+		return role.ErrRoleInvalidScopes().
+			WithDetail("reason", "platform scopes are not available in tenant IAM")
+	}
+
+	if err := s.validateScopes(r.Scopes, authCtx.Scopes); err != nil {
+		return err
+	}
+
+	// Verify user exists
+	_, err = s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return user.ErrUserNotFound()
+	}
+
+	userRole := role.UserRole{
+		UserID:     userID,
+		RoleID:     roleID,
+		TenantID:   tenantID,
+		AssignedAt: time.Now().UTC(),
+	}
+
+	return s.roleRepo.AssignToUser(ctx, userRole)
+}
+
+// UnassignRoleFromUser removes a role from a user
+func (s *RoleService) UnassignRoleFromUser(
+	ctx context.Context,
+	authCtx *kernel.AuthContext,
+	roleID kernel.RoleID,
+	userID kernel.UserID,
+	tenantID kernel.TenantID,
+) error {
+	if err := authz.Require(authCtx, tenantID, scopes.ScopeRolesAssign); err != nil {
+		return err
+	}
+
+	return s.roleRepo.UnassignFromUser(ctx, userID, roleID, tenantID)
+}
+
+// GetUserRoles returns all roles assigned to a user with effective scopes
+func (s *RoleService) GetUserRoles(
+	ctx context.Context,
+	authCtx *kernel.AuthContext,
+	userID kernel.UserID,
+	tenantID kernel.TenantID,
+) (*role.UserRolesResponse, error) {
+	if err := authz.Require(authCtx, tenantID, scopes.ScopeRolesRead); err != nil {
+		return nil, err
+	}
+
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return nil, user.ErrUserNotFound()
+	}
+
+	roles, err := s.roleRepo.FindByUser(ctx, userID, tenantID)
+	if err != nil {
+		return nil, errx.Wrap(err, "failed to get user roles", errx.TypeInternal)
+	}
+
+	dtos := make([]role.RoleDTO, 0, len(roles))
+	for _, r := range roles {
+		dtos = append(dtos, r.ToDTO())
+	}
+
+	effectiveScopes := s.resolveEffectiveScopes(userEntity.Scopes, roles)
+
+	return &role.UserRolesResponse{
+		UserID:          userID,
+		Roles:           dtos,
+		DirectScopes:    userEntity.Scopes,
+		EffectiveScopes: effectiveScopes,
+	}, nil
+}
+
+// GetEffectiveScopes resolves the complete set of scopes for a user:
+// direct user scopes + all scopes from assigned roles (deduplicated)
+func (s *RoleService) GetEffectiveScopes(
+	ctx context.Context,
+	userID kernel.UserID,
+	tenantID kernel.TenantID,
+) ([]string, error) {
+	userEntity, err := s.userRepo.FindByID(ctx, userID, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	roles, err := s.roleRepo.FindByUser(ctx, userID, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.resolveEffectiveScopes(userEntity.Scopes, roles), nil
+}
+
+func (s *RoleService) resolveEffectiveScopes(directScopes []string, roles []*role.Role) []string {
+	seen := make(map[string]struct{}, len(directScopes))
+	result := make([]string, 0, len(directScopes))
+
+	// Add direct scopes first
+	for _, scope := range directScopes {
+		if _, ok := seen[scope]; !ok {
+			seen[scope] = struct{}{}
+			result = append(result, scope)
+		}
+	}
+
+	// Add role scopes (deduplicated)
+	for _, r := range roles {
+		for _, scope := range r.Scopes {
+			if _, ok := seen[scope]; !ok {
+				seen[scope] = struct{}{}
+				result = append(result, scope)
+			}
+		}
+	}
+
+	return result
+}
+
+func (s *RoleService) validateScopes(scopesList []string, callerScopes []string) error {
+	if len(scopesList) == 0 {
+		return role.ErrRoleInvalidScopes().WithDetail("reason", "at least one scope is required")
+	}
+
+	// Platform permissions are never assignable through tenant IAM.
+	if scopes.ContainsPlatformScope(scopesList) {
+		return role.ErrRoleInvalidScopes().
+			WithDetail("reason", "platform scopes are not available in tenant IAM")
+	}
+
+	var invalidScopes []string
+	for _, scope := range scopesList {
+		if !scopes.ValidateScope(scope) {
+			invalidScopes = append(invalidScopes, scope)
+		}
+	}
+
+	if len(invalidScopes) > 0 {
+		return role.ErrRoleInvalidScopes().
+			WithDetail("invalid_scopes", invalidScopes).
+			WithDetail("hint", "Use scopes.GetAllScopes() to see valid options")
+	}
+
+	for _, scope := range scopesList {
+		if !kernel.ScopesContain(callerScopes, scope) {
+			return role.ErrRoleInvalidScopes().WithDetail("scope", scope)
+		}
+	}
+
+	return nil
+}

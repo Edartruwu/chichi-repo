@@ -1,0 +1,46 @@
+# Local development infrastructure for the whole repo: PostgreSQL + Redis.
+#
+# This is the only compose file; backend/Makefile points at it too. Database
+# name, user and password must match the POSTGRES_* values in backend/Makefile.
+#
+# Ports are published on localhost only. If 5432 or 6379 is taken by another
+# project, override per command: `make up dev POSTGRES_PORT=5433 REDIS_PORT=6380`.
+
+# Explicit project name so volumes and containers never collide with other
+# checkouts on the same machine.
+name: chichi
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: chichi-postgres
+    environment:
+      POSTGRES_DB: backenddb
+      POSTGRES_USER: backend
+      POSTGRES_PASSWORD: supersecret
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backend -d backenddb"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    container_name: chichi-redis
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  postgres_data:
+  redis_data:
